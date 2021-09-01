@@ -1,0 +1,42 @@
+[package]
+name = "evm-trace-extract"
+version = "0.1.0"
+authors = [""]
+edition = "2018"
+
+[lib]
+name = "common"
+path = "src/common/lib.rs"
+
+[[bin]]
+name = "dep-graph"
+path = "src/dep-graph/main.rs"
+
+[[bin]]
+name = "evm-trace-extract"
+path = "src/evm-trace-extract/main.rs"
+
+[[bin]]
+name = "rpc-to-disk"
+path = "src/rpc-to-disk/main.rs"
+
+[dependencies]
+env_logger = "0.8.3"
+futures = "0.3.14"
+lazy_static = "1.4.0"
+log = "0.4.14"
+regex = "1.4.5"
+rmp-serde = "0.15.4"
+rocksdb = "0.16.0"
+rustop = "1.1.1"
+serde = { version = "1.0.90", features = ["derive"] }
+serde_json = "1.0.64"
+tokio = { version = "1.5.0", features = ["rt-multi-thread"] }
+
+[dependencies.web3]
+git = "https://github.com/tomusdrw/rust-web3"
+rev = "376bc7ea8ee78142b175f7f99787de15742b0790"
+
+[dev-dependencies]
+maplit = "1.0.2"
+serial_test = "0.5.1"
