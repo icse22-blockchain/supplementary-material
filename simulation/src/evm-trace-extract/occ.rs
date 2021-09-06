@@ -156,6 +156,277 @@ pub fn batches(txs: &Vec<TransactionInfo>, gas: &Vec<U256>, batch_size: usize) -
 }
 
 #[allow(dead_code)]
+pub fn deterministic_scheduling(
+    txs: &Vec<TransactionInfo>,
+    gas: &Vec<U256>,
+    _info: &Vec<rpc::TxInfo>,
+    num_threads: usize,
+
+    allow_check_conflicts_before_commit: bool,
+) -> (U256, U256) {
+    assert_eq!(txs.len(), gas.len());
+
+    type MinHeap<T> = BinaryHeap<Reverse<T>>;
+
+    // transaction queue: transactions waiting to be executed
+    // item: <(storage-version, transaction-id)>
+    // pop() always returns the lowest storage-version
+    let mut tx_queue: MinHeap<(i32, usize)> =
+        (0..txs.len()).map(|tx_id| Reverse((-1, tx_id))).collect();
+
+    // transaction ready to schedule : txns have less or equal storage version than the current committed storage version
+    // item: <(transaction-id, storage-version)>
+    // pop() always returns the lowest transaction-id
+    let mut tx_ready_to_schedule: MinHeap<(usize, i32)> = Default::default();
+
+    // commit queue: txs that finished execution and are waiting to commit
+    // item: <transaction-id, storage-version>
+    // pop() always returns the lowest transaction-id
+    // storage-version is the highest committed transaction-id before the tx's execution started
+    let mut commit_queue: MinHeap<(usize, i32)> = Default::default();
+
+    // next transaction-id to commit
+    let mut next_to_commit = 0;
+
+    // thread pool: information on current execution on each thread
+    // item: < gas-left, transaction-id, storage-version>
+    // pop() always returns the least gas-left
+    let mut threads: MinHeap<(U256, usize, i32)> = Default::default();
+
+    // overall cost of execution
+    let mut cost = U256::from(0);
+
+    #[allow(non_snake_case)]
+    let mut N = 0;
+
+    let mut num_aborts = U256::from(0);
+
+    // just for checking RW-conflict between a to-commit txn(R) and a just-executed txn(W)
+    let is_wr_conflict = |executed: usize, to_commit: usize| {
+        for acc in txs[to_commit]
+            .accesses
+            .iter()
+            .filter(|a| a.mode == AccessMode::Read)
+        {
+            if let Target::Storage(addr, entry) = &acc.target {
+                if txs[executed]
+                    .accesses
+                    .contains(&Access::storage_write(addr, entry))
+                {
+                    log::trace!(
+                        "tx-{}/tx-{} wr conflict on {}-{}",
+                        executed,
+                        to_commit,
+                        addr,
+                        entry
+                    );
+                    return true;
+                }
+            }
+        }
+
+        false
+    };
+
+    log::trace!("-----------------------------------------");
+
+    loop {
+        // ---------------- exit condition ----------------
+        if next_to_commit == txs.len() {
+            // we have committed all transactions
+            // nothing left to execute or commit
+            assert!(
+                tx_queue.is_empty() && tx_ready_to_schedule.is_empty(),
+                "tx queue not empty"
+            );
+            assert!(commit_queue.is_empty(), "commit queue not empty");
+
+            // all threads are idle
+            assert!(threads.is_empty(), "some threads are not idle");
+
+            break;
+        }
+
+        // ---------------- scheduling ----------------
+        // push prepared txs to tx_ready_to_schedule from tx_queue
+        while let Some(Reverse((sv, tx_id))) = tx_queue.pop() {
+            if sv > next_to_commit as i32 - 1 {
+                tx_queue.push(Reverse((sv, tx_id)));
+                break;
+            }
+            log::trace!("[{}] (tx-{}, sv({})) is ready for scheduling", N, tx_id, sv);
+            tx_ready_to_schedule.push(Reverse((tx_id, sv)));
+        }
+
+        log::trace!("[{}] threads before scheduling: {:?}", N, threads);
+        log::trace!("[{}] tx queue before scheduling: {:?}", N, tx_queue);
+        log::trace!(
+            "[{}] txs ready for scheduling: {:?}",
+            N,
+            tx_ready_to_schedule
+        );
+        log::trace!("[{}] commit queue before scheduling: {:?}", N, commit_queue);
+
+        'schedule: loop {
+            // check if there are any idle threads
+            if threads.len() == num_threads {
+                break 'schedule;
+            }
+
+            // get tx from tx_queue
+            if let Some(Reverse((tx_id, sv))) = tx_ready_to_schedule.pop() {
+                log::trace!(
+                    "[{}] attempting to schedule tx-{} ({})...",
+                    N,
+                    tx_id,
+                    &txs[tx_id].tx_hash[0..8]
+                );
+
+                // schedule on the first idle thread
+                log::trace!(
+                    "[{}] scheduling tx-{} ({}) to a thread",
+                    N,
+                    tx_id,
+                    &txs[tx_id].tx_hash[0..8],
+                );
+
+                let gas_left = gas[tx_id];
+
+                threads.push(Reverse((gas_left, tx_id, sv)));
+            } else {
+                break 'schedule;
+            }
+        }
+
+        // ---------------- execution ----------------
+        // find transaction that finishes execution next
+        log::trace!("[{}] threads before execution: {:?}", N, threads);
+        if let Some(Reverse((gas_step, tx_id, sv))) = threads.pop() {
+            log::trace!(
+                "[{}] executing tx-{} ({}) (step = {})",
+                N,
+                tx_id,
+                &txs[tx_id].tx_hash[0..8],
+                gas_step
+            );
+            if allow_check_conflicts_before_commit {
+                let mut old_commit_queue: MinHeap<(usize, i32)> = commit_queue.clone();
+                commit_queue.clear();
+                while let Some(Reverse((c_id, c_sv))) = old_commit_queue.pop() {
+                    if ((tx_id as i32) > c_sv) && (tx_id < c_id) && (is_wr_conflict(tx_id, c_id)) {
+                        // re-schedule aborted tx
+                        num_aborts += U256::from(1);
+                        tx_queue.push(Reverse((c_id as i32 - 1, c_id)));
+                    } else {
+                        commit_queue.push(Reverse((c_id, c_sv)));
+                    }
+                }
+            }
+
+            // finish executing tx, update thread states
+            commit_queue.push(Reverse((tx_id, sv)));
+            cost += gas_step;
+
+            threads = threads
+                .into_iter()
+                .map(|Reverse((gas_left, tx_id, sv))| Reverse((gas_left - gas_step, tx_id, sv)))
+                .collect();
+        }
+
+        log::trace!("[{}] threads after execution: {:?}", N, threads);
+
+        // ---------------- commit / abort ----------------
+
+        log::trace!("[{}] commit queue before committing: {:?}", N, commit_queue);
+        log::trace!(
+            "[{}] next_to_commit before committing: {:?}",
+            N,
+            next_to_commit
+        );
+
+        while let Some(Reverse((tx_id, sv))) = commit_queue.peek() {
+            log::trace!(
+                "[{}] attempting to commit tx-{} ({}, sv = {})...",
+                N,
+                tx_id,
+                &txs[*tx_id].tx_hash[0..8],
+                sv
+            );
+
+            // we must commit transactions in order
+            if *tx_id != next_to_commit {
+                log::trace!(
+                    "[{}] unable to commit tx-{} ({}): next to commit is tx-{} ({})",
+                    N,
+                    tx_id,
+                    &txs[*tx_id].tx_hash[0..8],
+                    next_to_commit,
+                    &txs[next_to_commit].tx_hash[0..8]
+                );
+                assert!(*tx_id > next_to_commit);
+                break;
+            }
+
+            let Reverse((tx_id, sv)) = commit_queue.pop().unwrap();
+
+            // if allow check conflicts before commit, we skip the unnecessary conflicts' check below
+            if allow_check_conflicts_before_commit {
+                log::trace!(
+                    "[{}] COMMIT tx-{} ({})",
+                    N,
+                    tx_id,
+                    &txs[tx_id].tx_hash[0..8]
+                );
+                next_to_commit += 1;
+                continue;
+            }
+
+            // check all potentially conflicting transactions
+            // e.g. if tx-3 was executed with sv = -1, it means that it cannot see writes by tx-0, tx-1, tx-2
+            let conflict_from = usize::try_from(sv + 1).expect("sv + 1 should be non-negative");
+            let conflict_to = tx_id;
+
+            let accesses = &txs[tx_id].accesses;
+            let mut aborted = false;
+
+            'outer: for prev_tx in conflict_from..conflict_to {
+                let concurrent = &txs[prev_tx].accesses;
+
+                for acc in accesses.iter().filter(|a| a.mode == AccessMode::Read) {
+                    if let Target::Storage(addr, entry) = &acc.target {
+                        if concurrent.contains(&Access::storage_write(addr, entry)) {
+                            log::trace!("[{}] wr conflict between tx-{} ({}) [committed] and tx-{} ({}) [to be committed], ABORT tx-{}", N, prev_tx, &txs[prev_tx].tx_hash[0..8], tx_id, &txs[tx_id].tx_hash[0..8], tx_id);
+                            aborted = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+
+            // commit transaction
+            if !aborted {
+                log::trace!(
+                    "[{}] COMMIT tx-{} ({})",
+                    N,
+                    tx_id,
+                    &txs[tx_id].tx_hash[0..8]
+                );
+                next_to_commit += 1;
+                continue;
+            }
+
+            // re-schedule aborted tx
+            num_aborts += U256::from(1);
+            tx_queue.push(Reverse((tx_id as i32 - 1, tx_id)));
+        }
+
+        N += 1;
+        log::trace!("[{}] cost so far: {}", N, cost);
+    }
+    (cost, num_aborts)
+}
+
+#[allow(dead_code)]
 pub fn thread_pool(
     txs: &Vec<TransactionInfo>,
     gas: &Vec<U256>,
